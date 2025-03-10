@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM alpine:edge
+FROM docker.io/library/alpine:edge
 WORKDIR /app
 COPY requirements.txt .
 
