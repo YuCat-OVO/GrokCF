@@ -74,6 +74,10 @@ class Config(BaseSettings):
         default=None,
         description="可选代理配置，格式：protocol://user:pass@host:port",
     )
+    log_level: str = Field(
+        default="INFO",
+        description="日志级别",
+    )
     mihomo_url: HttpUrl | None = Field(
         default="http://localhost:8000",
         description="Mihomo服务地址",
@@ -416,8 +420,9 @@ def update_cookie(solver: Solver) -> None:
 
 
 def main():
+    log_level = logging.getLevelName(config.log_level)
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
