@@ -1,7 +1,10 @@
 import json
 import logging
+import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from contextlib import contextmanager
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
 
@@ -21,7 +24,7 @@ class Config(BaseSettings):
     :param solver_timeout: 解析器请求超时时间（秒），最小值1
     :param update_endpoint: 云防火墙凭证更新端点 URL
     :param endpoint_auth: 端点认证密钥，至少6个字符
-    :param interval: 健康检查间隔秒数，None 表示禁用
+    :param interval: 刷新 Cookies 间隔秒数
     :param proxy: 代理配置，格式：protocol://user:pass@host:port
     :param mihomo_url: Mihomo 服务地址
     :param mihomo_group_name: Mihomo 代理组名，至少2个字符
@@ -60,7 +63,12 @@ class Config(BaseSettings):
     interval: int | None = Field(
         default=300,
         gt=0,
-        description="健康检查间隔时间（秒），最小值1",
+        description="刷新 Cookies 间隔秒数（秒），最小值1",
+    )
+    min_exec_interval: int | None = Field(
+        default=10,
+        gt=0,
+        description="最小的执行间隔秒数（秒），最小值1",
     )
     proxy: str | None = Field(
         default=None,
@@ -149,12 +157,12 @@ class Solver(ABC):
             )
             response.raise_for_status()
         except requests.RequestException as e:
-            logging.error(f"请求失败: {str(e)}")
+            logging.error("请求失败: %s", str(e))
             return None
         try:
             response = response.json()
         except json.JSONDecodeError:
-            logging.error(f"无效的JSON响应: {response.text}")
+            logging.error("无效的JSON响应: %s", response.text)
             return None
         return response
 
@@ -169,7 +177,7 @@ class Solver(ABC):
             logging.warning("解析器响应为空")
             return ""
         if response.get("status") != "ok":
-            logging.warning(f"异常响应状态: {response.get('status')}")
+            logging.warning("异常响应状态: %s", response.get("status"))
             return ""
         return next(
             (
@@ -240,9 +248,7 @@ class Flaresolverr(Solver):
                     timeout=self.timeout,
                 ).raise_for_status()
             except requests.RequestException as e:
-                logging.error(
-                    f"会话销毁异常: {str(e)}",
-                )
+                logging.error("会话销毁异常: %s", str(e))
 
     @contextmanager
     def _managed_session(self) -> "SolverSession":
@@ -263,9 +269,7 @@ class Flaresolverr(Solver):
                 config.solver_url, json=destroy_json, timeout=config.solver_timeout
             ).raise_for_status()
         except requests.RequestException as e:
-            logging.error(
-                f"会话销毁失败: {str(e)}",
-            )
+            logging.error("会话销毁失败: %s", str(e))
 
     def get_clearance_cookie(self) -> str:
         """通过Flaresolverr获取云防火墙验证cookie"""
@@ -317,36 +321,98 @@ class Byparr(Solver):
         return self._parse_cookies(response)
 
 
-def update_cookie(solver) -> None:
-    """更新云防火墙的验证 Cookie
+class TaskScheduler:
+    """定时任务调度器，支持防止重复执行
 
-    通过调用解析器获取最新的云防火墙验证信息，并更新到目标网站
-
-    :return: None
+    :param interval: 任务执行间隔时间（秒）
+    :param task: 要执行的任务函数（无参数）
+    :param min_interval: 最小执行间隔保护（默认10秒）
     """
-    cookie = solver.get_clearance_cookie()
-    if not cookie:
-        logging.error(
-            "获取验证信息失败,cookie为空,可能您的IP比较干净或者解析器出现问题"
-        )
+
+    def __init__(
+        self, interval: float, task: Callable[[], None], min_interval: float = 10
+    ) -> None:
+        if interval < min_interval:
+            raise ValueError(f"间隔时间不能小于 {min_interval} 秒")
+
+        self.interval = interval
+        self.task = task
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._last_run = 0.0
+        self._thread = threading.Thread(target=self._run)
+
+    def start(self) -> None:
+        """启动任务调度器"""
+        if self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread.start()
+
+    def stop(self) -> None:
+        """停止任务调度器"""
+        self._stop_event.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        """调度器主循环"""
+        while not self._stop_event.is_set():
+            elapsed = monotonic() - self._last_run
+            if elapsed < self.interval:
+                sleep_time = min(self.interval - elapsed, self.min_interval)
+                self._stop_event.wait(sleep_time)
+                continue
+
+            if self._lock.acquire(blocking=False):
+                try:
+                    self.task()
+                    self._last_run = monotonic()
+                finally:
+                    self._lock.release()
+            else:
+                self._stop_event.wait(self.min_interval)
+
+    def trigger_now(self) -> bool:
+        """立即触发任务执行（如果当前未运行）
+
+        :return: 是否成功触发执行
+        """
+        if self._lock.acquire(blocking=False):
+            try:
+                self.task()
+                self._last_run = monotonic()
+                return True
+            finally:
+                self._lock.release()
+        return False
+
+
+def update_cookie(solver: Solver) -> None:
+    """更新云防火墙的验证 Cookie。
+    通过解析器获取最新云防火墙验证信息并更新到目标网站
+    :param solver: 提供清除 Cookie 功能的解析器实例
+    """
+    if not (cookie := solver.get_clearance_cookie()):
+        logging.error("获取验证信息失败: cookie 为空 (可能IP未被限制或解析器异常)")
         return
-    else:
-        logging.debug(f"获取到的Cookie: {cookie}")
-    request_header = {"Authorization": f"Bearer {config.endpoint_auth}"}
+    logging.debug("获取到有效 Cookie: %s", cookie)
+    endpoint = config.update_endpoint
+    headers = {"Authorization": f"Bearer {config.endpoint_auth}"}
+    payload = {"cf_clearance": f"cf_clearance={cookie}"}
+    timeout = config.solver_timeout // 1000
     try:
-        # 修改cf_clearance POST /set/cf_clearance {cf_clearance: "cf_clearance=XXXXXXXX"} 更新cf_clearance Cookie
         response = requests.post(
-            config.update_endpoint,
-            headers=request_header,
-            json={"cf_clearance": f"cf_clearance={cookie}"},
-            timeout=config.solver_timeout // 1000,
+            url=endpoint,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
         )
         response.raise_for_status()
-    except requests.RequestException as e:
-        logging.error(f"更新失败: {str(e)}")
+    except requests.RequestException as exc:
+        logging.error("更新请求失败: %s", exc, exc_info=exc)
         return
-
-    logging.info(f"更新成功, Cookie: {cookie}")
+    logging.info("Cookie 更新成功")
 
 
 def main():
@@ -358,7 +424,11 @@ def main():
     logging.info("开始运行")
 
     solver = Flaresolverr() if config.solver_type == "flaresolverr" else Byparr()
-    update_cookie(solver)
+
+    tasker = TaskScheduler(
+        config.interval, lambda: update_cookie(solver), config.min_exec_interval
+    )
+    tasker.start()
 
 
 if __name__ == "__main__":
