@@ -45,9 +45,9 @@ class Config(BaseSettings):
         description="目标监控网站地址",
     )
     solver_timeout: int = Field(
-        default=300,
+        default=200000,
         gt=0,
-        description="解析器请求超时时间（秒），最小值1",
+        description="解析器请求超时时间（毫秒），最小值1",
     )
     update_endpoint: str = Field(
         default="http://localhost:8000/set/cf_clearance",
@@ -143,7 +143,9 @@ class Solver(ABC):
 
         try:
             response = requests.post(
-                config.solver_url, json=request_json, timeout=config.solver_timeout
+                config.solver_url,
+                json=request_json,
+                timeout=config.solver_timeout // 1000,
             )
             response.raise_for_status()
         except requests.RequestException as e:
@@ -163,7 +165,10 @@ class Solver(ABC):
         :param response: 解析器返回的响应字典
         :return: 找到的cookie值或空字符串
         """
-        if not response or response.get("status") != "ok":
+        if not response:
+            logging.warning("解析器响应为空")
+            return ""
+        if response.get("status") != "ok":
             logging.warning(f"异常响应状态: {response.get('status')}")
             return ""
         return next(
@@ -177,6 +182,8 @@ class Solver(ABC):
 
 
 class Flaresolverr(Solver):
+    """通过 Flaresolverr 获取云防火墙凭证"""
+
     class SolverSession:
         """管理Flaresolverr会话生命周期"""
 
@@ -193,7 +200,7 @@ class Flaresolverr(Solver):
                 create_json["proxy"] = proxy_config
 
             response = requests.post(
-                config.solver_url, json=create_json, timeout=self.timeout
+                config.solver_url, json=create_json, timeout=self.timeout // 1000
             ).json()
 
             if response.get("status") == "ok":
@@ -289,7 +296,7 @@ class Flaresolverr(Solver):
 
 
 class Byparr(Solver):
-    """通过外部解析服务获取云防火墙凭证
+    """通过 Byparr 获取云防火墙凭证
 
     注意：当前实现可能返回空Cookie，暂时优先使用 Flaresolverr
     """
@@ -332,7 +339,7 @@ def update_cookie(solver) -> None:
             config.update_endpoint,
             headers=request_header,
             json={"cf_clearance": f"cf_clearance={cookie}"},
-            timeout=config.solver_timeout,
+            timeout=config.solver_timeout // 1000,
         )
         response.raise_for_status()
     except requests.RequestException as e:
