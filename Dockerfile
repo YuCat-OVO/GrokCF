@@ -1,14 +1,16 @@
 # syntax=docker/dockerfile:1
 FROM alpine:edge
+WORKDIR /app
+COPY requirements.txt .
 
 RUN \
-    sed -i 's/dl-cdn.alpinelinux.org/mirrors.zju.edu.cn/g' /etc/apk/repositories && \
+    sed -i 's/dl-cdn.alpinelinux.org/mirrors.bfsu.edu.cn/g' /etc/apk/repositories && \
     apk update --no-cache && \
-    apk add wget --no-cache && \
-    apk add --no-cache curl jq
+    apk add --no-cache python pip && \
+    pip config set global.extra-index-url "https://mirrors.bfsu.edu.cn/pypi/web/simple" && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip cache purge
 
-COPY update_cookie.sh /app/update_cookie.sh
+COPY --chmod=755 update_cookie.py .
 
-RUN chmod +x /app/update_cookie.sh
-
-CMD ["/app/update_cookie.sh"]
+CMD ["python", "/app/update_cookie.py"]
